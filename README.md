@@ -11,52 +11,84 @@ python massive-gcp/seed.py --users x1 --posts x2 --follows-min x3 --follows-max 
 Cette commande va générer x1 utilisateurs, x2 posts, et chaque user va suivre x3 autres user. Il est important de préciser que on ne peut pas associer un nombre exact de post à chaque utilisateur.
 Si on veut 1000 users avec chacun 50 posts, on génèrera 50000 posts mais on ne peut pas garantir que chaque user aura exactement 50 posts.
 
-Pour évaluer la performance, on utilise apache-bench. La commande à utiliser est
+Pour évaluer la performance, on utilise locust. Voici le script utilisé:
 ```
-ab -n 1 -c x1 https://tiny-insta-474215.appspot.com/api/timeline?user=user1
+from locust import HttpUser, task, events
+from gevent.event import Event
+from itertools import count
+
+start_event = Event()
+user_counter = count(1)
+finished_users = 0
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    global finished_users
+    finished_users = 0
+    print("Test started")
+
+@events.spawning_complete.add_listener
+def on_spawning_complete(user_count, **kwargs):
+    print(f"All {user_count} users spawned")
+    start_event.set() 
+
+class TimelineUser(HttpUser):
+    wait_time = lambda self: 999999  # empêche répétition
+
+    def on_start(self):
+        self.user_id = next(user_counter)
+        self.username = f"user{self.user_id}"
+        self.has_fired = False
+        start_event.wait()
+
+    @task
+    def fire_once(self):
+        global finished_users
+
+        if not self.has_fired:
+            self.has_fired = True
+
+            url = f"/api/timeline?user={self.username}"
+            self.client.get(url, name="/api/timeline")
+
+            finished_users += 1
+
+            total_users = self.environment.runner.user_count
+
+            if finished_users >= total_users:
+                self.environment.runner.quit()
+
 ```
-Cette commande va effectuer x1 requêtes simultanées mais uniquement sur la timeline de user1. Apache-bench ne possède pas de méthode permettant de modifier l'url que l'on test, garantissant ainsi que l'on interroge x1 users différents.  
-Voici la solution que j'ai mise en place afin de garantir que la commande appelle bien des user différent:
+Ce script se déroule en 2 parties. Dans un premier temps, on fait apparaître tous nos utilisateurs, puis lorsqu'il sont tous prêts à exécuter leur appel, ils l'effectuent en même temps. On recueille les résultats via le lien obtenus en éxecutant la commande
+
 ```
-shuf -i 1-x1 -n x2 | sed "s|^|https://tiny-insta-474215.appspot.com/api/timeline?user=user|" > urlsx2.txt
-time cat urlsx2.txt | parallel -j x2 "ab -n 1 -c 1 {} 2>&1 | grep -E 'Failed requests|Non-2xx' >> errors.txt"
+locust -f locust_test.py --host https://tiny-insta-474215.appspot.com
 ```
-On commence par mélanger les nombres entre 1 et x1 et on en sélectionne x2. ```sed``` va ensuite rajouter ce chiffre à la fin, ce qui va créer des url avec des user différents, puis on sauvegarde ces urls dans le fichier urlsx2.txt  
-Pour lancer ```ab``` avec ces urls, on utilise la commande ```parallel``` pour lancer x2 commandes ```ab``` simultanées, puis enfin on récupère les messages d'erreur et les requêtes échoués dans errors.txt  
-Cependant, la commande parallèle est limitée et ne permet pas d'effectuer 1000 appels simultanés. Pour ce cas particulier, j'ai utilisé la commande
-```
-time cat urls1000.txt | xargs -n 1 -P 1000 -I {} sh -c "ab -n 1 -c 1 {} 2>&1 | grep -E 'Failed requests|Non-2xx' >> errors.txt"
-```
-# Remarques
-Bien que ces commandes fonctionne, on ne peut plus récupérer les données via ```ab```. On est obligé d'utiliser la commande ```time```. Le temps obtenu avec risque d'être plus long car on mesure aussi le temps que prennent ces commandes, et pas uniquement le temps des requêtes.  
-De plus, on ne sait pas exactement comment fonctionne ```parallel``` et ```xargs```. ```xargs``` doit ouvrir des nouveaux shell, ce qui risque de créer une latence et d'encore plus fausser nos résultats.
 
 # Résultats
 A chaque fois que nécessaire, la commande ```seed.py``` était utilisée pour rajouter des posts ou des follows.  
 L'entièreté des posts et des users étaient supprimés manuellement lorsque le nombre de users ou de posts devaient être réduits, avant de réutiliser la commande ```seed.py``` pour garantir que la répartition du nombre de posts par user était correcte.
-Chaque commande ```time``` était lancée une première fois pour vérifier que l'absence d'erreurs et la cohérences des résultats, puis les 3 runs mesurés étaient ensuite effectués.
 
 <p align="center">
-<img width="942" height="530" alt="conc" src="https://github.com/user-attachments/assets/e331cb1b-1e29-4a6e-be5a-02a122189661" />  
+<img width="1000" height="600" alt="conc" src="https://github.com/user-attachments/assets/95a367a7-de52-4d76-875b-820f36387b78" />
 </p>
 
 Temps moyen par requête selon la concurrence
 
 <p align="center">
-<img width="942" height="530" alt="post" src="https://github.com/user-attachments/assets/eb36e9d2-aed9-44d7-9405-6240de87365e" />  
+<img width="1000" height="600" alt="post" src="https://github.com/user-attachments/assets/d407bd5a-837a-4bcc-b784-c0cfc3047a54" />
 </p>
 
 Temps moyen par requête selon le nombre de posts par utilisateur
 
 <p align="center">
-<img width="942" height="530" alt="fanout" src="https://github.com/user-attachments/assets/ae1064bb-c071-429b-83f0-deef8acdab08" />  
+<img width="1000" height="600" alt="fanout" src="https://github.com/user-attachments/assets/972c7896-8e99-4fea-be71-1bf623063b03" />
 </p>
 
 Temps moyen par requête selon le nombre de followee
 # Discussion
-La concurrence entraîne de gros ralentissement. Le serveur ne peut pas absorber 1000 requêtes simultanées, et une file d'attente va se mettre en place.  
-Il est également possible, comme annoncé plus haut, que la commande ```xargs``` créée elle même artificiellement cette file d'attente en saturant la machien, ne sachant comment paralléliser 1000 commande ```ab``` pour les effectuer en simultané.
+La concurrence entraîne de gros ralentissement. Le serveur sature, ne pouvant pas absorber 1000 requêtes simultanées, et une file d'attente va se mettre en place.  
 
 On n'observe pas de ralentissements significatifs lorsque le nombre de posts augmente. Cela s'explique par le fait que la requête de timeline se limite à 20 posts. Comme le Datastore google cloud utilise un index, on n'a pas à parcourir l'entièreté de la base de données ce qui rend la requête efficace. On récupère alors au plus 20 posts pour chacun des utilisateurs que l'on suit et on les merge pour récupérer les 20 derniers globaux. La quantité de posts que l'on récupère est donc quasiment constante.
 
-A contrario, on s'attendrait à observer un ralentissement lorsque le nombre d'utilisateurs suivis augmentent. En effet, le nombre de posts récupérés est un multiple du nombre d'utilisateurs suivis. Ici, on ne voit pas ce ralentissement. Dans le processus d'expérimentation, on lance la commande une première fois. On peut imaginer que le résultat de cette requête est enregistré en mémoire, ce qui rend le résultat constant pour les requêtes suivantes. Il est surtout probable que le choix d'utiliser ```parallel``` créé du bruit empêchant de mesurer les variations proprement. En effet, l'ordre de grandeur du nombre de posts à rechercher reste faible quelque soit le nombre d'utilisateurs que l'on follow. La recherche de posts prend beaucoup moins de temps que les 0.8 secondes que l'on observe, et le coût que l'on souhaite mesurer est donc caché.
+On observe un léger ralentissement lorsque le nombre de followee augmente. Comme expliqué précedemment, On récupère au plus 20 posts pour chacun des utilisateurs que l'on suit. Ainsi, plus on augmente le nombre de personne que l'on suit, plus le nombre de posts récupéré augmente et plus le temps que prend la requête augmente. Les mesures effectuées restent de l'ordre du dixième de seconde, il faudrait encore plus accentuer les paramètres afin de mieux observer ce ralentissement.
